@@ -499,6 +499,8 @@ test(
     const details = res.details as { runId?: string; background?: boolean; resumedFrom?: string };
     assert.ok(details.runId, "a new run id should be returned");
     assert.equal(details.background, true);
+    assert.equal((res.details as { contractVersion?: number }).contractVersion, 1);
+    assert.equal((res.details as { executionEpoch?: number }).executionEpoch, 1);
     assert.equal(details.resumedFrom, undefined, "a fresh run is not a resume");
     assert.equal(manager.listRuns().length, 1, "exactly one new run created");
     // The returned text advertises the revise/iterate path.
@@ -531,6 +533,8 @@ return await agent('one')`;
     const done = await tool.execute("sc2", { script: syncScript, background: false }, undefined, undefined, undefined);
     const doneRunId = (done.details as { runId?: string }).runId;
     assert.ok(doneRunId);
+    assert.equal((done.details as { contractVersion?: number }).contractVersion, 1);
+    assert.equal((done.details as { executionEpoch?: number }).executionEpoch, 1);
     assert.deepEqual(
       (done as { structuredContent?: unknown }).structuredContent,
       { runId: doneRunId, status: "completed", result: "ok" },
@@ -581,6 +585,8 @@ return { a, b }`;
     const details = res.details as { runId?: string; resumedFrom?: string };
     assert.equal(details.runId, runId, "resumed run keeps the same run id");
     assert.equal(details.resumedFrom, runId);
+    assert.equal((res.details as { contractVersion?: number }).contractVersion, 1);
+    assert.equal((res.details as { executionEpoch?: number }).executionEpoch, 2);
     assert.deepEqual(
       (res as { structuredContent?: unknown }).structuredContent,
       { runId, status: "resumed" },
@@ -640,6 +646,8 @@ return { a, b, synthesis }`;
     const details = res.details as { runId?: string; resumedFrom?: string };
     assert.equal(details.runId, runId);
     assert.equal(details.resumedFrom, runId);
+    assert.equal((res.details as { contractVersion?: number }).contractVersion, 1);
+    assert.equal((res.details as { executionEpoch?: number }).executionEpoch, 2);
 
     for (let i = 0; i < 200 && manager.getRun(runId)?.status === "running"; i++) {
       await new Promise((resolve) => setTimeout(resolve, 10));

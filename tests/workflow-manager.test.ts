@@ -7368,3 +7368,76 @@ test(
     persistence.releaseRunLease(lease);
   }),
 );
+
+test(
+  "legacy complete pending freezes the old summary without inventing v1 on resume",
+  withTempCwd(async (cwd) => {
+    const manager = new WorkflowManager({ cwd, agent: fakeAgent() });
+    const persistence = manager.getPersistence();
+    persistence.save({
+      runId: "legacy-complete",
+      workflowName: "old-workflow",
+      script: oneAgentScript,
+      status: "paused",
+      result: { verdict: "OLD RESULT ONLY" },
+      pendingDelivery: { kind: "complete", deliveryId: "legacy-id" },
+      phases: [],
+      agents: [],
+      logs: [],
+      startedAt: "2026-07-18T00:00:00.000Z",
+      updatedAt: "2026-07-18T00:00:00.000Z",
+    });
+    manager.setSessionId("new-origin");
+    const completed = once(manager, "complete");
+    assert.equal(await manager.resume("legacy-complete"), true);
+    await completed;
+    const state = persistence.load("legacy-complete");
+    assert.equal(state?.executionEpoch, 1);
+    const queued = state?.queuedDeliveries?.[0];
+    assert.equal(queued?.kind, "text");
+    assert.equal(queued?.identity, undefined);
+    assert.equal(queued?.deliveryId, "legacy-id");
+    assert.ok(queued?.kind === "text");
+    assert.match(queued.text, /OLD RESULT ONLY/);
+    assert.match(queued.text, /old-workflow/);
+    assert.equal(state?.pendingDelivery, undefined);
+  }),
+);
+
+test(
+  "resume refuses epoch overflow without execution, events, or a retained lease",
+  withTempCwd(async (cwd) => {
+    let calls = 0;
+    const manager = new WorkflowManager({
+      cwd,
+      agent: {
+        async run() {
+          calls++;
+          return "bad";
+        },
+      },
+    });
+    const persistence = manager.getPersistence();
+    persistence.save({
+      runId: "epoch-overflow",
+      executionEpoch: Number.MAX_SAFE_INTEGER,
+      workflowName: "overflow",
+      script: oneAgentScript,
+      status: "paused",
+      phases: [],
+      agents: [],
+      logs: [],
+      startedAt: "2026-07-18T00:00:00.000Z",
+      updatedAt: "2026-07-18T00:00:00.000Z",
+    });
+    let events = 0;
+    manager.on("resumed", () => events++);
+    await assert.rejects(manager.resume("epoch-overflow"), /epoch exhausted/);
+    assert.equal(calls, 0);
+    assert.equal(events, 0);
+    assert.equal(manager.getRun("epoch-overflow"), undefined);
+    const lease = persistence.acquireRunLease("epoch-overflow");
+    assert.ok(lease);
+    persistence.releaseRunLease(lease);
+  }),
+);

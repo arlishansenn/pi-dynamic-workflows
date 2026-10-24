@@ -85,6 +85,8 @@ export type {
   PersistedRunState,
   RunPersistence,
   RunStatus,
+  WorkflowExecutionIdentity,
+  WorkflowResultDetails,
 } from "./run-persistence.js";
 export { createRunPersistence, generateRunId } from "./run-persistence.js";
 export {

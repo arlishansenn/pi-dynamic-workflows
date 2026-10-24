@@ -21,7 +21,17 @@ import {
   type WorkflowAgentSnapshot,
   type WorkflowSnapshot,
 } from "./display.js";
-import type { PendingDeliveryMarker, PersistedRunState } from "./run-persistence.js";
+import {
+  executionIdentity,
+  type PendingDeliveryMarker,
+  type PersistedRunState,
+  type WorkflowExecutionIdentity,
+  type WorkflowResultDetails,
+} from "./run-persistence.js";
+import { DEFAULT_DELIVERED_MAX_CHARS, deliverText } from "./workflow-delivery-text.js";
+
+export { deliverText } from "./workflow-delivery-text.js";
+
 import { runSummary } from "./run-record-store.js";
 import type { ManagedRun, WorkflowManager } from "./workflow-manager.js";
 import type { WorkflowStorage } from "./workflow-saved.js";
@@ -58,68 +68,11 @@ export interface TaskPanelOptions {
   loadSettings?: () => WorkflowSettings;
 }
 
-/** Default cap on the JSON-dump fallback in a delivered result summary. Overridable
- *  via the `deliveredResultMaxChars` setting in ~/.pi/workflows/settings.json. */
-const DEFAULT_DELIVERED_MAX_CHARS = 400;
-
-/** Human-readable byte size for the dropped-tail hint: 512 B, 3.2 KB, 1.4 MB. */
-function formatBytes(n: number): string {
-  if (n < 1024) return `${n} B`;
-  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
-  return `${(n / (1024 * 1024)).toFixed(1)} MB`;
-}
-
-/**
- * Pick a clean human-readable summary from a workflow result, in order of
- * preference: a `verdict`/`report`/`summary`/`synthesis` string field, a bare
- * string result, else a JSON dump capped at `maxChars`. When the dump is truncated the
- * dropped size is reported (the full result is still reachable via the pointer
- * that {@link deliverText} appends).
- */
-function summarizeResult(result: unknown, maxChars: number = DEFAULT_DELIVERED_MAX_CHARS): string {
-  if (typeof result === "string") return result;
-  if (result == null) return "null";
-  if (typeof result === "object") {
-    const obj = result as Record<string, unknown>;
-    // `synthesis` is what the built-in multi-perspective workflow returns.
-    for (const key of ["verdict", "report", "summary", "synthesis"] as const) {
-      const val = obj[key];
-      if (typeof val === "string" && val.trim()) return val;
-    }
-  }
-  const json = JSON.stringify(result, null, 2);
-  if (json.length <= maxChars) return json;
-  // Slice once (the kept head); derive the dropped size by byte-length subtraction
-  // so we don't also allocate the (potentially large) truncated tail to measure it.
-  const kept = json.slice(0, maxChars);
-  const droppedBytes = Buffer.byteLength(json, "utf8") - Buffer.byteLength(kept, "utf8");
-  return `${kept}\n…(truncated ${formatBytes(droppedBytes)})`;
-}
-
 function fitLine(line: string, width?: number): string {
   if (typeof width !== "number" || !Number.isFinite(width)) return line;
   const maxWidth = Math.max(0, Math.floor(width));
   if (visibleWidth(line) <= maxWidth) return line;
   return truncateToWidth(line, maxWidth);
-}
-
-export function deliverText(run: ManagedRun, opts: { resultPath?: string; maxChars?: number } = {}): string {
-  const summary = summarizeResult(run.result?.result, opts.maxChars);
-  const tu = run.result?.tokenUsage;
-  const cost = tu?.cost ? ` · ${fmtCost(tu.cost)}` : "";
-  const segment = fmtTokenSegment(tokenFigures(tu), fmtTokensShort);
-  const tokens = `${segment ? ` · ${segment}` : ""}${cost}`;
-  const agents = run.result?.agentCount ?? run.snapshot.agentCount;
-  const duration = run.result?.durationMs ? ` · ${(run.result.durationMs / 1000).toFixed(1)}s` : "";
-  const lines = [
-    `✓ Background workflow "${run.snapshot.name}" finished (${agents} agents${tokens}${duration}).`,
-    "",
-    summary,
-  ];
-  // Always point at the full persisted result so the tail is never lost — even when
-  // the summary above is a complete verdict/summary field or an untruncated dump.
-  if (opts.resultPath) lines.push("", `↳ Full result: ${opts.resultPath}`);
-  return lines.join("\n");
 }
 
 /** Absolute path to a run's persisted result JSON. Undefined if the persistence
@@ -170,7 +123,7 @@ type DeliveryMessage = {
   customType: string;
   content: string;
   display: boolean;
-  details?: { deliveryId?: string };
+  details?: { deliveryId?: string } & Partial<WorkflowResultDetails>;
 };
 
 type DeliverySend = (message: DeliveryMessage, options: { triggerTurn: boolean; deliverAs: "followUp" }) => unknown;
@@ -655,7 +608,7 @@ function patchAgentSessionCapture(): void {
 
 export const WORKFLOW_LIFECYCLE_EVENT = "pi-dynamic-workflows:lifecycle";
 
-export interface WorkflowLifecycleEvent {
+export interface WorkflowLifecycleEvent extends Partial<WorkflowExecutionIdentity> {
   status: "started" | "resumed" | "paused" | "completed" | "failed" | "stopped";
   runId: string;
   name: string;
@@ -681,7 +634,12 @@ function resolveDeliverySessionId(run: ManagedRun, manager: WorkflowManager): st
 }
 
 function sameDelivery(a: PendingDeliveryMarker | undefined, b: PendingDeliveryMarker): boolean {
-  return a?.kind === b.kind && (a.kind !== "text" || (b.kind === "text" && a.text === b.text));
+  return (
+    a?.identity?.executionEpoch === b.identity?.executionEpoch &&
+    a?.identity?.runId === b.identity?.runId &&
+    a?.kind === b.kind &&
+    (a.kind !== "text" || (b.kind === "text" && a.text === b.text))
+  );
 }
 
 function markerWithId(marker: PendingDeliveryMarker, existing?: PendingDeliveryMarker): PendingDeliveryMarker {
@@ -690,8 +648,15 @@ function markerWithId(marker: PendingDeliveryMarker, existing?: PendingDeliveryM
 }
 
 function markRunPending(run: ManagedRun, marker: PendingDeliveryMarker): PendingDeliveryMarker {
-  const identified = markerWithId(marker, run.pendingDelivery);
-  if (run.pendingDelivery?.deliveryId !== identified.deliveryId) deliveredAwaitingClear.delete(run.runId);
+  const identity = executionIdentity(run);
+  const identified = markerWithId({ ...marker, ...(identity ? { identity } : {}) }, run.pendingDelivery);
+  const awaiting = deliveredAwaitingClear.get(run.runId);
+  if (
+    awaiting &&
+    run.pendingDelivery?.deliveryId !== identified.deliveryId &&
+    !run.queuedDeliveries?.some((entry) => entry.deliveryId === awaiting.deliveryId)
+  )
+    deliveredAwaitingClear.delete(run.runId);
   run.pendingDelivery = identified;
   return identified;
 }
@@ -707,27 +672,32 @@ function clearRunPending(
   // Clear disk first. If that fails, retain the live marker so the delivered
   // message remains visible to the bounded clear retry instead of being lost.
   try {
-    const live = run ?? manager.getRun(runId);
-    if (live?.pendingDelivery?.deliveryId && live.pendingDelivery.deliveryId !== deliveryId) return "stale";
-
+    const live = manager.getRun(runId) ?? run;
     const persistence = manager.getPersistence?.();
     if (persistence) {
       if (persistence.updateMetadata) {
         if (!persistence.updateMetadata(runId, { pendingDelivery: undefined }, deliveryId)) {
-          if (!persistence.loadPreview?.(runId)) throw new Error("persisted run disappeared before delivery ACK");
+          if (!(persistence.loadPreview?.(runId) ?? persistence.load(runId)))
+            throw new Error("persisted run disappeared before delivery ACK");
           return "stale";
         }
       } else {
         const state = persistence.load(runId);
         if (!state) throw new Error("persisted run disappeared before delivery ACK");
-        if (state.pendingDelivery?.deliveryId && state.pendingDelivery.deliveryId !== deliveryId) return "stale";
-        if (state.pendingDelivery) {
-          const { pendingDelivery: _drop, ...rest } = state;
-          persistence.save(rest as PersistedRunState);
-        }
+        if (state.pendingDelivery?.deliveryId === deliveryId) {
+          persistence.save({ ...state, pendingDelivery: undefined });
+        } else if (state.queuedDeliveries?.some((marker) => marker.deliveryId === deliveryId)) {
+          persistence.save({
+            ...state,
+            queuedDeliveries: state.queuedDeliveries.filter((marker) => marker.deliveryId !== deliveryId),
+          });
+        } else return "stale";
       }
     }
-    if (live) live.pendingDelivery = undefined;
+    if (live) {
+      if (live.pendingDelivery?.deliveryId === deliveryId) live.pendingDelivery = undefined;
+      live.queuedDeliveries = live.queuedDeliveries?.filter((marker) => marker.deliveryId !== deliveryId);
+    }
     return "cleared";
   } catch {
     warnDelivery(
@@ -746,11 +716,22 @@ function persistRunPending(manager: WorkflowManager, run: ManagedRun): boolean {
     // minimal marker-bearing record; the subsequent manager write overwrites.
     const persistence = manager.getPersistence?.();
     if (!persistence) return true;
-    if (persistence.updateMetadata?.(run.runId, { pendingDelivery: run.pendingDelivery, sessionId: run.sessionId }))
+    if (
+      persistence.updateMetadata?.(run.runId, {
+        pendingDelivery: run.pendingDelivery,
+        queuedDeliveries: run.queuedDeliveries,
+        sessionId: run.sessionId,
+      })
+    )
       return true;
     const existing = persistence.load(run.runId);
     if (existing) {
-      persistence.save({ ...existing, pendingDelivery: run.pendingDelivery, sessionId: run.sessionId });
+      persistence.save({
+        ...existing,
+        pendingDelivery: run.pendingDelivery,
+        queuedDeliveries: run.queuedDeliveries,
+        sessionId: run.sessionId,
+      });
       return true;
     }
     if (run.pendingDelivery) {
@@ -769,6 +750,7 @@ function persistRunPending(manager: WorkflowManager, run: ManagedRun): boolean {
         startedAt: run.startedAt?.toISOString?.() ?? new Date().toISOString(),
         updatedAt: new Date().toISOString(),
         pendingDelivery: run.pendingDelivery,
+        queuedDeliveries: run.queuedDeliveries,
       });
     }
     return true;
@@ -823,7 +805,11 @@ function contentForPending(
  * fire-and-forget sends and durable appends are NOT success (append writes
  * history without triggerTurn). Does not clear pending markers.
  */
-function tryDeliverEndpoint(endpoint: SessionDeliveryEndpoint, content: string, deliveryId: string): Promise<boolean> {
+function tryDeliverEndpoint(
+  endpoint: SessionDeliveryEndpoint,
+  content: string,
+  marker: PendingDeliveryMarker,
+): Promise<boolean> {
   if (endpoint.suspended) return Promise.resolve(false);
   if (endpoint.sessionId && sessionEndpoints.get(endpoint.sessionId) !== endpoint) {
     // Stale endpoint object after rebind/drop.
@@ -834,7 +820,15 @@ function tryDeliverEndpoint(endpoint: SessionDeliveryEndpoint, content: string, 
   if (typeof endpoint.send === "function") {
     try {
       const ret = endpoint.send(
-        { customType: "workflow-result", content, display: true, details: { deliveryId } },
+        {
+          customType: "workflow-result",
+          content,
+          display: true,
+          details: {
+            deliveryId: marker.deliveryId,
+            ...(marker.identity ? { ...marker.identity, sessionId: endpoint.sessionId } : {}),
+          },
+        },
         { triggerTurn: true, deliverAs: "followUp" },
       );
       if (ret != null && typeof (ret as { then?: unknown }).then === "function") {
@@ -922,9 +916,11 @@ function deliverAndAck(
   runId: string,
   sessionId: string,
   content: string,
-  deliveryId: string,
+  marker: PendingDeliveryMarker,
   run?: ManagedRun,
 ): void {
+  const deliveryId = marker.deliveryId;
+  if (!deliveryId) return;
   if (inFlightDeliveries.has(runId)) return;
   const endpoint = sessionEndpoints.get(sessionId);
   if (!endpoint) {
@@ -951,6 +947,7 @@ function deliverAndAck(
     if (clear !== "failed") {
       deliveredAwaitingClear.delete(runId);
       cancelDeliveryRetry(runId);
+      flushSessionDiskPending(manager, sessionId, endpoint);
     } else {
       scheduleDeliveryRetry(manager, runId, sessionId, endpoint.generation);
     }
@@ -971,7 +968,7 @@ function deliverAndAck(
   const token = ++inFlightSeq;
   inFlightDeliveries.set(runId, { token, sessionId });
   const startedGeneration = endpoint.generation;
-  void tryDeliverEndpoint(endpoint, content, deliveryId)
+  void tryDeliverEndpoint(endpoint, content, marker)
     .then((ok) => {
       if (ok) {
         cancelDeliveryRetry(runId);
@@ -983,9 +980,7 @@ function deliverAndAck(
         if (clear === "failed") {
           deliveredAwaitingClear.set(runId, { deliveryId, sessionId, generation: startedGeneration });
           scheduleDeliveryRetry(manager, runId, sessionId, startedGeneration);
-        } else if (clear === "stale") {
-          // This send belonged to an older marker. Release before flushing the
-          // newer delivery, and let the ownership token protect its lock.
+        } else {
           releaseDelivery(runId, token);
           const active = sessionEndpoints.get(sessionId);
           if (active && !active.suspended && active.manager) {
@@ -1049,7 +1044,7 @@ function routeBackgroundDelivery(
   }
 
   // 2. Deliver only via the originating session's endpoint; clear after ACK.
-  deliverAndAck(manager, run.runId, sessionId, content, deliveryId, run);
+  deliverAndAck(manager, run.runId, sessionId, content, pending, run);
 }
 
 /**
@@ -1188,20 +1183,35 @@ export function resumeSessionDelivery(sessionId: string | undefined, manager?: W
 function flushSessionDiskPending(manager: WorkflowManager, sessionId: string, endpoint: SessionDeliveryEndpoint): void {
   if (endpoint.suspended) return;
 
-  const tryOne = (runId: string, marker: PendingDeliveryMarker, run?: ManagedRun, persisted?: PersistedRunState) => {
+  const tryOne = (
+    runId: string,
+    marker: PendingDeliveryMarker,
+    queued: boolean,
+    run?: ManagedRun,
+    persisted?: PersistedRunState,
+  ) => {
     if (inFlightDeliveries.has(runId)) return;
     let identified = marker;
     if (!identified.deliveryId) {
       identified = markerWithId(marker);
-      if (run) run.pendingDelivery = identified;
       try {
         const persistence = manager.getPersistence?.();
-        if (persistence?.updateMetadata) {
-          if (!persistence.updateMetadata(runId, { pendingDelivery: identified }))
-            throw new Error("persisted run disappeared before delivery");
+        const state = persisted ?? persistence?.load(runId);
+        if (queued) {
+          const queuedDeliveries = (run?.queuedDeliveries ?? state?.queuedDeliveries ?? []).map((entry, index) =>
+            index === 0 ? identified : entry,
+          );
+          if (run) run.queuedDeliveries = queuedDeliveries;
+          if (persistence?.updateMetadata) {
+            if (!persistence.updateMetadata(runId, { queuedDeliveries }))
+              throw new Error("persisted run disappeared before delivery");
+          } else if (persistence && state) persistence.save({ ...state, queuedDeliveries });
         } else {
-          const state = persisted ?? persistence?.load(runId);
-          if (persistence && state) persistence.save({ ...state, pendingDelivery: identified });
+          if (run) run.pendingDelivery = identified;
+          if (persistence?.updateMetadata) {
+            if (!persistence.updateMetadata(runId, { pendingDelivery: identified }))
+              throw new Error("persisted run disappeared before delivery");
+          } else if (persistence && state) persistence.save({ ...state, pendingDelivery: identified });
         }
       } catch {
         warnDelivery(sessionId, `Workflow ${runId}: delivery deferred because its marker could not be saved.`);
@@ -1216,17 +1226,18 @@ function flushSessionDiskPending(manager: WorkflowManager, sessionId: string, en
     }
     const content = contentForPending(manager, runId, identified, endpoint.loadSettings, run, persisted);
     if (content === undefined) return;
-    deliverAndAck(manager, runId, sessionId, content, deliveryId, run);
+    deliverAndAck(manager, runId, sessionId, content, identified, run);
   };
 
   // Live in-memory runs for this session. Null sessionId is claimable only for
   // THIS manager's live runs (pre-bind completions) — never from a foreign manager.
   try {
     for (const run of manager.listLiveRuns?.() ?? []) {
-      if (!run.pendingDelivery) continue;
+      const marker = run.queuedDeliveries?.[0] ?? run.pendingDelivery;
+      if (!marker) continue;
       if (run.sessionId != null && run.sessionId !== sessionId) continue;
       if (run.sessionId == null) run.sessionId = sessionId;
-      tryOne(run.runId, run.pendingDelivery, run);
+      tryOne(run.runId, marker, !!run.queuedDeliveries?.length, run);
     }
   } catch {
     // listLiveRuns may be absent on stubs
@@ -1239,12 +1250,13 @@ function flushSessionDiskPending(manager: WorkflowManager, sessionId: string, en
     const persistence = manager.getPersistence?.();
     if (!persistence) return;
     for (const state of persistence.list()) {
-      if (!state.pendingDelivery) continue;
+      const marker = state.queuedDeliveries?.[0] ?? state.pendingDelivery;
+      if (!marker) continue;
       if (state.sessionId !== sessionId) continue;
       // Skip if the live copy still carries the marker — the loop above owns it.
       const live = manager.getRun?.(state.runId);
-      if (live?.pendingDelivery) continue;
-      tryOne(state.runId, state.pendingDelivery, live, state);
+      if (live?.pendingDelivery || live?.queuedDeliveries?.length) continue;
+      tryOne(state.runId, marker, !!state.queuedDeliveries?.length, live, state);
     }
   } catch {
     // best-effort
@@ -1306,8 +1318,9 @@ export function installResultDelivery(
     m.__lifecycleEventInstalled = true;
     const emitLifecycle =
       (status: WorkflowLifecycleEvent["status"]) =>
-      ({ runId }: { runId: string }) => {
-        const run = manager.getRun(runId);
+      (event: { runId: string; executionRun?: ManagedRun } & Partial<WorkflowExecutionIdentity>) => {
+        const { runId } = event;
+        const run = event.executionRun ?? manager.getRun(runId);
         const persistence = manager.getPersistence();
         const persisted = run
           ? undefined
@@ -1321,6 +1334,7 @@ export function installResultDelivery(
             : undefined;
         if (!lifecycle) return;
         m.__lifecycleEventEmitter?.({
+          ...(event.contractVersion === 1 ? executionIdentity(event) : undefined),
           status,
           runId,
           name: lifecycle.name,
@@ -1391,8 +1405,8 @@ export function installResultDelivery(
   if (m.__deliveryInstalled) return;
   m.__deliveryInstalled = true;
 
-  manager.on("complete", ({ runId }: { runId: string }) => {
-    const run = manager.getRun(runId);
+  manager.prependListener("complete", ({ runId, executionRun }: { runId: string; executionRun?: ManagedRun }) => {
+    const run = executionRun ?? manager.getRun(runId);
     // Only background/resumed runs are delivered: a foreground (sync) run already
     // returns its result inline as the tool result, so re-delivering would dup it.
     if (!run?.background) return;
@@ -1404,35 +1418,40 @@ export function installResultDelivery(
         loadSettings: endpoint?.loadSettings ?? m.__deliveryLoadSettings,
       }),
     });
-    routeBackgroundDelivery(manager, run, { kind: "complete" }, content);
+    routeBackgroundDelivery(manager, run, { kind: "text", text: content }, content);
   });
 
-  manager.on("error", ({ runId, error }: { runId: string; error?: { message?: string } }) => {
-    const run = manager.getRun(runId);
-    if (!run?.background) return;
-    const text = `✗ Background workflow ${runId} failed: ${error?.message ?? "unknown error"}`;
-    routeBackgroundDelivery(manager, run, { kind: "text", text }, text);
-  });
+  manager.prependListener(
+    "error",
+    ({ runId, error, executionRun }: { runId: string; error?: { message?: string }; executionRun?: ManagedRun }) => {
+      const run = executionRun ?? manager.getRun(runId);
+      if (!run?.background) return;
+      const text = `✗ Background workflow ${runId} failed: ${error?.message ?? "unknown error"}`;
+      routeBackgroundDelivery(manager, run, { kind: "text", text }, text);
+    },
+  );
 
   // A provider usage/quota limit checkpoints the run as paused (not failed): tell the
   // user it is resumable once their budget refills, rather than letting it look dead.
   // Manual pause() also emits "paused" but with no reason — guard so only the
   // usage-limit case delivers a message.
-  manager.on(
+  manager.prependListener(
     "paused",
     ({
       runId,
+      executionRun,
       reason,
       error,
       resetHint,
     }: {
       runId: string;
+      executionRun?: ManagedRun;
       reason?: string;
       error?: { message?: string };
       resetHint?: string;
     }) => {
       if (reason !== "usage_limit") return;
-      const run = manager.getRun(runId);
+      const run = executionRun ?? manager.getRun(runId);
       if (!run?.background) return;
       const when = resetHint ? ` (${resetHint})` : "";
       const cause = error?.message ?? "provider usage limit reached";

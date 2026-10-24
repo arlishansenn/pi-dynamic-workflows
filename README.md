@@ -407,3 +407,56 @@ The code-mode orchestration idea comes from [Michael Livs' original pi-dynamic-w
 ## License
 
 MIT — see [LICENSE](./LICENSE).
+
+
+## Execution and delivery identity
+
+New executions expose the following identity in `workflow` result `details`,
+`workflow_control` result `details.run`, and the existing
+`pi-dynamic-workflows:lifecycle` event:
+
+```ts
+{
+  contractVersion: 1,
+  runId: string,
+  executionEpoch: number,
+  originSessionId?: string,
+  sessionId?: string
+}
+```
+
+`executionEpoch` is a positive safe integer. Start commits epoch 1 before execution.
+Only a real resume increments it. Status queries, retries, session adoption, and
+cold recovery do not increment it. `originSessionId` captures the session bound
+at this execution's start or resume. `sessionId` is the current routing owner and
+can change through explicit adoption. Adoption does not transfer consumer task
+ownership. An execution started without a bound session can omit the origin.
+
+Background launch details retain `background: true`. Resume launch details also
+retain `resumedFrom`. Control details retain `{action, result, run}`. The existing
+`structuredContent` output remains unchanged and is not the v1 identity source.
+Lifecycle events retain `status` and `name` and do not contain a delivery ID.
+
+The existing `workflow-result` custom message includes the same identity in
+`details`, plus an opaque `deliveryId` and the actual endpoint's `sessionId`.
+It has no `status`. A report confirms delivery, not completion. In particular,
+a usage-limit pause can produce a report. Manual pause, durable checkpoint pause,
+and stop do not gain a guaranteed report. Foreground results remain inline.
+
+Reports freeze their identity and rendered text before sending. Resume retains
+unacknowledged old reports in a small displaced-report queue. Retries preserve
+their delivery IDs. An ACK removes only its matching report, never a newer epoch's
+pending report. Lifecycle and host message order is not guaranteed, and consumers
+must deduplicate deliveries by identity and delivery ID.
+
+Old reports without an epoch remain legacy messages with only `deliveryId`.
+They do not inherit the current execution's identity. Consumers must not infer
+an epoch from a name, timing, or the only outstanding run. Unknown protocol
+versions must not be treated as v1. The exported identity additions on existing
+public types are optional for source compatibility with older constructors.
+
+These guarantees cover committed files and process restart, not administrator
+rollback of run storage. Downgrading to a producer that does not preserve
+`queuedDeliveries` can lose queued reports. Stop execution and back up run storage
+or drain pending reports before an authorized downgrade. This change does not
+install, publish, or migrate any existing producer installation.

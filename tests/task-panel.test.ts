@@ -638,6 +638,228 @@ describe("installResultDelivery", () => {
     mod.bindSessionDelivery(sessionId, pi, { manager, ...bindOpts, stableSend });
   }
 
+  it("freezes v1 report identity and publishes the same lifecycle identity", async () => {
+    const pi = createMockPi();
+    const run = makeRun({ executionEpoch: 3, originSessionId: "origin-session" });
+    const manager = createMockManager(run);
+    const sent: unknown[] = [];
+    const events: unknown[] = [];
+    pi.events.on(mod.WORKFLOW_LIFECYCLE_EVENT, (event) => events.push(event));
+    setup(pi, manager, SESSION, {
+      stableSend: (message) => {
+        sent.push(message);
+        return Promise.resolve();
+      },
+    });
+    manager.emit("complete", {
+      runId: run.runId,
+      contractVersion: 1,
+      executionEpoch: 3,
+      originSessionId: "origin-session",
+    });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(sent.length, 1);
+    const message = sent[0] as { details: Record<string, unknown> };
+    assert.equal(typeof message.details.deliveryId, "string");
+    assert.deepEqual(message.details, {
+      contractVersion: 1,
+      runId: run.runId,
+      executionEpoch: 3,
+      originSessionId: "origin-session",
+      sessionId: SESSION,
+      deliveryId: message.details.deliveryId,
+    });
+    assert.deepEqual(events, [
+      {
+        status: "completed",
+        name: "test-workflow",
+        runId: run.runId,
+        sessionId: SESSION,
+        contractVersion: 1,
+        executionEpoch: 3,
+        originSessionId: "origin-session",
+      },
+    ]);
+  });
+
+  it("flushes displaced reports before the new slot and an old ACK preserves the new report", async () => {
+    const pi = createMockPi();
+    const oldIdentity = { contractVersion: 1, runId: "test-run-1", executionEpoch: 1, originSessionId: "old-origin" };
+    const newIdentity = { ...oldIdentity, executionEpoch: 2, originSessionId: "new-origin" };
+    const run = makeRun({
+      executionEpoch: 2,
+      originSessionId: "new-origin",
+      queuedDeliveries: [{ kind: "text", text: "old frozen report", deliveryId: "old-report", identity: oldIdentity }],
+      pendingDelivery: { kind: "text", text: "new frozen report", deliveryId: "new-report", identity: newIdentity },
+    });
+    const manager = createMockManager(run);
+    manager.getPersistence?.().save({ ...run });
+    const sent: Array<{ content?: string; details?: { deliveryId?: string } }> = [];
+    const acks: Array<() => void> = [];
+    setup(pi, manager, SESSION, {
+      stableSend: (message) => {
+        sent.push(message);
+        return new Promise<void>((resolve) => acks.push(resolve));
+      },
+    });
+    assert.equal(sent.length, 1);
+    assert.equal(sent[0].content, "old frozen report");
+    assert.deepEqual(sent[0].details, { ...oldIdentity, deliveryId: "old-report", sessionId: SESSION });
+    acks[0]();
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(sent.length, 2);
+    assert.equal(sent[1].content, "new frozen report");
+    const state = manager.getPersistence?.().load(run.runId);
+    assert.deepEqual(state?.queuedDeliveries, []);
+    assert.equal((state?.pendingDelivery as { deliveryId?: string }).deliveryId, "new-report");
+    acks[1]();
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(manager.getPersistence?.().load(run.runId)?.pendingDelivery, undefined);
+  });
+
+  it("drains a queued report after a failed ACK clear without resending or losing the new slot", async () => {
+    const pi = createMockPi();
+    const run = makeRun({
+      queuedDeliveries: [{ kind: "text", text: "old", deliveryId: "old-ack" }],
+      pendingDelivery: { kind: "text", text: "new", deliveryId: "new-ack" },
+    });
+    const manager = createMockManager(run);
+    manager.getPersistence?.().save({ ...run });
+    const getPersistence = manager.getPersistence;
+    let failed = false;
+    manager.getPersistence = () => {
+      const persistence = getPersistence?.();
+      assert.ok(persistence);
+      return {
+        ...persistence,
+        save: (state: Record<string, unknown>) => {
+          if (!failed && Array.isArray(state.queuedDeliveries) && state.queuedDeliveries.length === 0) {
+            failed = true;
+            throw new Error("queued ACK clear failed");
+          }
+          persistence.save(state);
+        },
+      };
+    };
+    const sent: string[] = [];
+    setup(pi, manager, SESSION, {
+      stableSend: (message) => {
+        sent.push(message.content ?? "");
+        return Promise.resolve();
+      },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    assert.equal(failed, true);
+    assert.deepEqual(sent, ["old", "new"]);
+    assert.deepEqual(manager.getPersistence?.().load(run.runId)?.queuedDeliveries, []);
+    assert.equal(manager.getPersistence?.().load(run.runId)?.pendingDelivery, undefined);
+  });
+
+  it("queued legacy markers without delivery IDs get durable IDs but no v1 identity", async () => {
+    const pi = createMockPi();
+    const manager = createMockManager(null);
+    manager.getPersistence?.().save({
+      runId: "legacy-queue",
+      sessionId: SESSION,
+      workflowName: "legacy",
+      status: "paused",
+      queuedDeliveries: [{ kind: "text", text: "legacy queued" }],
+    });
+    const sent: Array<{ details?: { deliveryId?: string } }> = [];
+    setup(pi, manager, SESSION, {
+      stableSend: (message) => {
+        sent.push(message);
+        return Promise.resolve();
+      },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(sent.length, 1);
+    assert.equal(typeof sent[0].details?.deliveryId, "string");
+    assert.deepEqual(Object.keys(sent[0].details ?? {}), ["deliveryId"]);
+    assert.deepEqual(manager.getPersistence?.().load("legacy-queue")?.queuedDeliveries, []);
+  });
+
+  it("real usage-limit resume preserves an in-flight old report until its own ACK", async () => {
+    const cwd = mkdtempSync(join(tmpdir(), "pi-dw-epoch-report-"));
+    let calls = 0;
+    const manager = new WorkflowManager({
+      cwd,
+      agent: {
+        async run() {
+          calls++;
+          if (calls === 1)
+            throw new WorkflowError("quota reached", WorkflowErrorCode.PROVIDER_USAGE_LIMIT, { recoverable: false });
+          return "new result";
+        },
+      },
+    });
+    const pi = createMockPi();
+    const sent: Array<{ content?: string; details?: Record<string, unknown> }> = [];
+    const acks: Array<() => void> = [];
+    try {
+      manager.setSessionId(SESSION);
+      mod.installResultDelivery(pi, manager);
+      mod.bindSessionDelivery(SESSION, pi, {
+        manager,
+        stableSend: (message) => {
+          sent.push(message);
+          return new Promise<void>((resolve) => acks.push(resolve));
+        },
+      });
+      const { runId, promise } = manager.startInBackground(lifecycleScript);
+      await promise.catch(() => {});
+      assert.equal(sent.length, 1);
+      assert.equal(sent[0].details?.executionEpoch, 1);
+      assert.match(sent[0].content ?? "", /quota reached/);
+      assert.equal(await manager.resume(runId), true);
+      for (let attempt = 0; attempt < 100 && manager.getRun(runId)?.status !== "completed"; attempt++)
+        await new Promise((resolve) => setTimeout(resolve, 2));
+      const beforeAck = manager.getPersistence().load(runId);
+      assert.equal(beforeAck?.executionEpoch, 2);
+      assert.equal(beforeAck?.queuedDeliveries?.[0].identity?.executionEpoch, 1);
+      assert.equal(beforeAck?.pendingDelivery?.identity?.executionEpoch, 2);
+      const newDeliveryId = beforeAck?.pendingDelivery?.deliveryId;
+      assert.notEqual(newDeliveryId, sent[0].details?.deliveryId);
+      acks[0]();
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      assert.equal(sent.length, 2);
+      assert.equal(sent[1].details?.executionEpoch, 2);
+      assert.equal(sent[1].details?.deliveryId, newDeliveryId);
+      assert.match(sent[1].content ?? "", /new result/);
+      assert.equal(manager.getPersistence().load(runId)?.pendingDelivery?.deliveryId, newDeliveryId);
+      assert.deepEqual(manager.getPersistence().load(runId)?.queuedDeliveries, []);
+      acks[1]();
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      assert.equal(manager.getPersistence().load(runId)?.pendingDelivery, undefined);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("identical failure text in a later epoch gets a different delivery ID", () => {
+    const pi = createMockPi();
+    const run = makeRun({ executionEpoch: 1, originSessionId: SESSION });
+    const manager = createMockManager(run);
+    mod.installResultDelivery(pi, manager);
+    manager.emit("error", { runId: run.runId, error: { message: "same failure" } });
+    const first = manager.getPersistence?.().load(run.runId)?.pendingDelivery as {
+      deliveryId?: string;
+      identity?: { executionEpoch: number };
+      text: string;
+    };
+    Object.assign(run, { executionEpoch: 2, queuedDeliveries: [first], pendingDelivery: undefined });
+    manager.emit("error", { runId: run.runId, error: { message: "same failure" } });
+    const second = manager.getPersistence?.().load(run.runId)?.pendingDelivery as {
+      deliveryId?: string;
+      identity?: { executionEpoch: number };
+      text: string;
+    };
+    assert.equal(first.text, second.text);
+    assert.notEqual(first.deliveryId, second.deliveryId);
+    assert.equal(first.identity?.executionEpoch, 1);
+    assert.equal(second.identity?.executionEpoch, 2);
+  });
+
   // ── deliverText: verdict path ──
 
   it("delivers verdict when result.result has verdict", () => {
@@ -1381,7 +1603,7 @@ describe("installResultDelivery", () => {
       return {
         ...persistence,
         save: (state: Record<string, unknown>) => {
-          if (failClear && !("pendingDelivery" in state)) {
+          if (failClear && state.pendingDelivery === undefined) {
             failClear = false;
             throw new Error("disk temporarily unavailable");
           }
