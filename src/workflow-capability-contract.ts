@@ -496,6 +496,9 @@ const capabilities: readonly CapabilityDescriptor[] = [
   toolInput("args", "args?: unknown"),
   toolInput("background", "background?: boolean = true", [
     "background workflows are headless; use background false when checkpoint must show foreground confirmation",
+    "new execution receipts expose contractVersion 1, runId, a durable positive-safe-integer executionEpoch, optional originSessionId, and optional routing sessionId in details; workflow_control exposes these under details.run",
+    "the existing pi-dynamic-workflows:lifecycle channel shares execution identity; workflow-result details add opaque deliveryId and the actual endpoint sessionId but no status",
+    "legacy pending reports without execution identity remain legacy; manual pause, checkpoint pause, and stop do not guarantee a host report",
   ]),
   toolInput("maxAgents", "maxAgents?: number = 1000", [
     "default, not a hard product maximum",
@@ -512,6 +515,7 @@ const capabilities: readonly CapabilityDescriptor[] = [
     "resumes a prior incomplete run with an edited script",
     "under the default prefix policy, unchanged positional agent calls replay from cache until the first changed, inserted, or never-completed call",
     "always runs in the background",
+    "only a real resume durably increments executionEpoch; old unacknowledged reports retain their frozen identity and text until a deliveryId-matched ACK",
   ]),
   toolInput("resumeMode", 'resumeMode?: "prefix" | "replay-completed" = "prefix"', [
     "applies only together with resumeFromRunId",

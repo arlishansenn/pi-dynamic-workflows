@@ -1,7 +1,12 @@
 import { defineTool, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { type Static, Type } from "typebox";
 import { aggregateAgentUsage, tokenFigures, type WorkflowAgentSnapshot, type WorkflowSnapshot } from "./display.js";
-import type { PersistedRunState, RunStatus } from "./run-persistence.js";
+import {
+  executionIdentity,
+  type PersistedRunState,
+  type RunStatus,
+  type WorkflowExecutionIdentity,
+} from "./run-persistence.js";
 import { runSummary } from "./run-record-store.js";
 import type { WorkflowManager, WorkflowResumeOptions } from "./workflow-manager.js";
 
@@ -55,7 +60,8 @@ export interface WorkflowControlToolOptions {
   getManager?: () => WorkflowManager;
 }
 
-export interface WorkflowControlRunDetails {
+export interface WorkflowControlRunDetails extends Partial<WorkflowExecutionIdentity> {
+  sessionId?: string;
   runId: string;
   workflowName: string;
   status: RunStatus;
@@ -255,6 +261,8 @@ function summarizeRun(run: PersistedRunState, live?: WorkflowSnapshot | null): W
   const persistedUsage = tokenFigures(run.tokenUsage);
   const agentUsage = live ? aggregateAgentUsage(agents) : summary.usage;
   return {
+    ...executionIdentity(run),
+    ...(run.sessionId ? { sessionId: run.sessionId } : {}),
     runId: run.runId,
     workflowName: live?.name ?? run.workflowName,
     status: run.status,

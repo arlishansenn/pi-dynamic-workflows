@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import {
   existsSync,
   mkdirSync,
@@ -1346,5 +1347,146 @@ test(
   withTempCwd(async (cwd) => {
     const m = new WorkflowManager({ cwd });
     assert.equal(m.getCwd(), cwd);
+  }),
+);
+
+test(
+  "cold process retains frozen delivery identity and old ACK cannot clear the current slot",
+  withTempCwd(async (cwd) => {
+    const persistence = createRunPersistence(cwd);
+    const identity = { contractVersion: 1, runId: "epoch-cold", executionEpoch: 1, originSessionId: "source" } as const;
+    const nextIdentity = { ...identity, executionEpoch: 2 };
+    const queued = { kind: "text", text: "old exact report", deliveryId: "old-id", identity } as const;
+    const current = { kind: "text", text: "new exact report", deliveryId: "new-id", identity: nextIdentity } as const;
+    persistence.save({
+      runId: identity.runId,
+      workflowName: "cold",
+      script: "return 1",
+      status: "paused",
+      sessionId: "destination",
+      executionEpoch: 2,
+      originSessionId: "source-two",
+      queuedDeliveries: [queued],
+      pendingDelivery: current,
+      phases: [],
+      agents: [],
+      logs: [],
+      startedAt: "2026-07-18T00:00:00.000Z",
+      updatedAt: "2026-07-18T00:00:00.000Z",
+    });
+    const output = execFileSync(
+      process.execPath,
+      [
+        "--import",
+        "tsx",
+        "--input-type=module",
+        "-e",
+        `
+      import { createRunPersistence } from ${JSON.stringify(new URL("../src/run-persistence.ts", import.meta.url).href)};
+      const persistence = createRunPersistence(${JSON.stringify(cwd)});
+      const before = persistence.loadPreview("epoch-cold");
+      const cleared = persistence.updateMetadata("epoch-cold", { pendingDelivery: undefined }, "old-id");
+      const after = persistence.load("epoch-cold");
+      console.log(JSON.stringify({ before, cleared, after }));
+    `,
+      ],
+      { encoding: "utf8", env: { ...process.env } },
+    );
+    const { before, cleared, after } = JSON.parse(output);
+    assert.equal(before.executionEpoch, 2);
+    assert.deepEqual(before.queuedDeliveries, [queued]);
+    assert.deepEqual(before.pendingDelivery, current);
+    assert.equal(cleared, true);
+    assert.deepEqual(after.queuedDeliveries, []);
+    assert.deepEqual(after.pendingDelivery, current);
+    assert.equal(persistence.updateMetadata?.(identity.runId, { pendingDelivery: undefined }, "old-id"), false);
+    assert.deepEqual(persistence.load(identity.runId)?.pendingDelivery, current);
+    assert.equal(persistence.updateMetadata?.(identity.runId, { pendingDelivery: undefined }, "new-id"), true);
+    assert.equal(persistence.load(identity.runId)?.pendingDelivery, undefined);
+  }),
+);
+
+test(
+  "invalid execution and delivery identities fail closed at persistence",
+  withTempCwd(async (cwd) => {
+    const persistence = createRunPersistence(cwd);
+    const base: PersistedRunState = {
+      runId: "bad-identity",
+      workflowName: "bad",
+      script: "return 1",
+      status: "paused",
+      phases: [],
+      agents: [],
+      logs: [],
+      startedAt: "2026-07-18T00:00:00.000Z",
+      updatedAt: "2026-07-18T00:00:00.000Z",
+    };
+    for (const executionEpoch of [0, -1, 1.5, Number.MAX_SAFE_INTEGER + 1, NaN, Infinity]) {
+      assert.throws(() => persistence.save({ ...base, executionEpoch }), /Invalid execution epoch/);
+    }
+    assert.throws(
+      () =>
+        persistence.save({
+          ...base,
+          pendingDelivery: {
+            kind: "text",
+            text: "wrong run",
+            identity: { contractVersion: 1, runId: "foreign", executionEpoch: 1 },
+          },
+        }),
+      /Invalid delivery identity/,
+    );
+    assert.equal(persistence.load(base.runId), null);
+  }),
+);
+
+test(
+  "a crash after the resume commit never reuses the committed epoch in a cold process",
+  withTempCwd(async (cwd) => {
+    const persistence = createRunPersistence(cwd);
+    persistence.save({
+      runId: "epoch-crash",
+      workflowName: "crash",
+      script: "export const meta = { name: 'crash', description: 'crash' }; return 1",
+      executionEpoch: 1,
+      status: "paused",
+      phases: [],
+      agents: [],
+      logs: [],
+      startedAt: "2026-07-18T00:00:00.000Z",
+      updatedAt: "2026-07-18T00:00:00.000Z",
+    });
+    const runChild = () =>
+      JSON.parse(
+        execFileSync(
+          process.execPath,
+          [
+            "--import",
+            "tsx",
+            "--input-type=module",
+            "-e",
+            `
+      import { WorkflowManager } from ${JSON.stringify(new URL("../src/workflow-manager.ts", import.meta.url).href)};
+      const manager = new WorkflowManager({ cwd: ${JSON.stringify(cwd)} });
+      manager.setSessionId("cold-origin");
+      manager.on("resumed", (event) => {
+        const state = manager.getPersistence().load("epoch-crash");
+        console.log(JSON.stringify({ event, epoch: state.executionEpoch }));
+        process.exit(0);
+      });
+      await manager.resume("epoch-crash");
+      process.exit(2);
+    `,
+          ],
+          { encoding: "utf8", env: { ...process.env } },
+        ),
+      );
+    const first = runChild();
+    const second = runChild();
+    assert.equal(first.epoch, 2);
+    assert.equal(first.event.executionEpoch, 2);
+    assert.equal(second.epoch, 3);
+    assert.equal(second.event.executionEpoch, 3);
+    assert.equal(persistence.load("epoch-crash")?.executionEpoch, 3);
   }),
 );

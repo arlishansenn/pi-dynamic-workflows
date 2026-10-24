@@ -15,10 +15,18 @@ import {
   type WorkflowSnapshot,
 } from "./display.js";
 import { WorkflowError, WorkflowErrorCode } from "./errors.js";
+import { executionIdentity } from "./run-persistence.js";
 import { parseWorkflowScript, type WorkflowResumeMode, type WorkflowRunResult } from "./workflow.js";
 import { WorkflowManager } from "./workflow-manager.js";
 import { createWorkflowStorage, type WorkflowStorage } from "./workflow-saved.js";
 import { loadWorkflowSettings } from "./workflow-settings.js";
+
+function executionDetails(manager: WorkflowManager, runId: string | undefined) {
+  if (!runId) return {};
+  const run = manager.getRun(runId) ?? manager.getPersistence().load(runId);
+  if (!run) return {};
+  return { ...executionIdentity(run), ...(run.sessionId ? { sessionId: run.sessionId } : {}) };
+}
 
 /** The single always-on gate that authorizes workflow use without forcing it. */
 export const WORKFLOW_GATE_GUIDELINE =
@@ -299,7 +307,12 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
                 text: resumedText(parsed.meta.name, runId, manager.getRun(runId)?.resumeMode ?? params.resumeMode),
               },
             ],
-            details: { runId, background: true, resumedFrom: runId },
+            details: {
+              ...executionDetails(manager, runId),
+              runId,
+              background: true,
+              resumedFrom: runId,
+            },
           },
           { runId, status: "resumed" },
         );
@@ -333,7 +346,11 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
         return withStructuredContent(
           {
             content: [{ type: "text", text: backgroundStartedText(parsed.meta.name, runId) }],
-            details: { runId, background: true },
+            details: {
+              ...executionDetails(manager, runId),
+              runId,
+              background: true,
+            },
           },
           { runId, status: "started" },
         );
@@ -441,6 +458,7 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
           ],
           details: {
             ...snapshot,
+            ...executionDetails(manager, result.runId),
             meta: result.meta,
             phases: result.phases,
             logs: result.logs,

@@ -45,6 +45,8 @@ const INDEX_KEYS = new Set([
   "workflowName",
   "status",
   "sessionId",
+  "executionEpoch",
+  "originSessionId",
   "parentSessionId",
   "parentSessionFile",
   "startedAt",
@@ -68,10 +70,12 @@ interface Head {
   keys: string[];
   index: Record<string, unknown>;
   summary: RunSummary;
-  pendingDelivery?: { kind: "complete" | "text"; deliveryId?: string };
+  pendingDelivery?: Pick<NonNullable<PersistedRunState["pendingDelivery"]>, "kind" | "deliveryId" | "identity">;
 }
 function markerIndex(marker: Head["pendingDelivery"]): Head["pendingDelivery"] {
-  return marker ? { kind: marker.kind, deliveryId: marker.deliveryId } : undefined;
+  return marker
+    ? { kind: marker.kind, deliveryId: marker.deliveryId, ...(marker.identity ? { identity: marker.identity } : {}) }
+    : undefined;
 }
 type Cell = string | string[] | Map<string, string>;
 type Cells = Map<string, Cell>;
@@ -104,11 +108,72 @@ const MAX_CACHE_BYTES = 16 * 1024 * 1024;
 function isHead(value: unknown): value is Head {
   return !!value && typeof value === "object" && (value as Head).format === FORMAT;
 }
+function validateExecutionFields(state: {
+  runId?: unknown;
+  executionEpoch?: unknown;
+  originSessionId?: unknown;
+  pendingDelivery?: unknown;
+  queuedDeliveries?: unknown;
+}): void {
+  const epoch = state.executionEpoch;
+  if (epoch !== undefined && (typeof epoch !== "number" || !Number.isSafeInteger(epoch) || epoch <= 0))
+    throw new Error("Invalid execution epoch");
+  if (
+    state.originSessionId !== undefined &&
+    (typeof state.originSessionId !== "string" || !state.originSessionId.trim())
+  )
+    throw new Error("Invalid execution origin");
+  const validateMarker = (marker: unknown) => {
+    if (
+      !marker ||
+      typeof marker !== "object" ||
+      !("kind" in marker) ||
+      (marker.kind !== "complete" && marker.kind !== "text")
+    )
+      throw new Error("Invalid pending delivery");
+    if (marker.kind === "text" && (!("text" in marker) || typeof marker.text !== "string"))
+      throw new Error("Invalid pending delivery text");
+    if (
+      "deliveryId" in marker &&
+      marker.deliveryId !== undefined &&
+      (typeof marker.deliveryId !== "string" || !marker.deliveryId.trim())
+    )
+      throw new Error("Invalid delivery ID");
+    if ("identity" in marker && marker.identity !== undefined) {
+      const identity = marker.identity;
+      if (
+        !identity ||
+        typeof identity !== "object" ||
+        !("contractVersion" in identity) ||
+        identity.contractVersion !== 1 ||
+        !("runId" in identity) ||
+        identity.runId !== state.runId ||
+        !("executionEpoch" in identity) ||
+        typeof identity.executionEpoch !== "number" ||
+        !Number.isSafeInteger(identity.executionEpoch) ||
+        identity.executionEpoch <= 0
+      )
+        throw new Error("Invalid delivery identity");
+      if (
+        "originSessionId" in identity &&
+        identity.originSessionId !== undefined &&
+        (typeof identity.originSessionId !== "string" || !identity.originSessionId.trim())
+      )
+        throw new Error("Invalid delivery origin");
+    }
+  };
+  if (state.pendingDelivery !== undefined) validateMarker(state.pendingDelivery);
+  if (state.queuedDeliveries !== undefined) {
+    if (!Array.isArray(state.queuedDeliveries)) throw new Error("Invalid queued deliveries");
+    for (const marker of state.queuedDeliveries) validateMarker(marker);
+  }
+}
 function validateRecord(record: PersistedRunState | Head): void {
   if (!record || typeof record !== "object" || Array.isArray(record)) throw new Error("Invalid run record");
   if (Object.hasOwn(record, "format") && !isHead(record)) throw new Error("Unsupported run record format");
   if (!isHead(record)) {
     if (typeof record.runId !== "string") throw new Error("Invalid legacy run identity");
+    validateExecutionFields(record);
     return;
   }
   if (
@@ -125,6 +190,11 @@ function validateRecord(record: PersistedRunState | Head): void {
     record.keys.some((key) => typeof key !== "string")
   )
     throw new Error("Invalid run head");
+  validateExecutionFields({
+    ...record.index,
+    pendingDelivery:
+      record.pendingDelivery?.kind === "text" ? { ...record.pendingDelivery, text: "" } : record.pendingDelivery,
+  });
 }
 function readRecord(fs: PersistenceFsLayer, path: string): PersistedRunState | Head | null {
   const record = readJsonWithBackupRecovery<PersistedRunState | Head>(fs, path);
@@ -295,6 +365,7 @@ export function createRunRecordStore(fs: PersistenceFsLayer) {
     }
     if (previous !== head.hash || sequence !== head.sequence || state.runId !== head.index.runId)
       throw new Error("Run commit mismatch");
+    validateExecutionFields(state);
     const result = state as unknown as PersistedRunState;
     remember(path, head, result, cellsOf(result));
     return result;
@@ -315,6 +386,7 @@ export function createRunRecordStore(fs: PersistenceFsLayer) {
     validateRecord(record);
     const head = isHead(record) ? record : undefined;
     const index = head?.index ?? Object.fromEntries(Object.entries(record).filter(([key]) => INDEX_KEYS.has(key)));
+    validateExecutionFields(index);
     const keys = head?.keys ?? Object.keys(record);
     const view = { ...index } as unknown as PersistedRunState;
     // Getters close over only the small head/path, never the hydrated state.
@@ -382,6 +454,7 @@ export function createRunRecordStore(fs: PersistenceFsLayer) {
     return next;
   }
   function save(path: string, state: PersistedRunState): void {
+    validateExecutionFields(state);
     const previous = readRecord(fs, path);
     const head = isHead(previous) ? previous : undefined;
     const prior = head ? hydrate(path, head) : undefined;
@@ -412,17 +485,30 @@ export function createRunRecordStore(fs: PersistenceFsLayer) {
   }
   function updateMetadata(
     path: string,
-    patch: Partial<Pick<PersistedRunState, "sessionId" | "pendingDelivery" | "autoResumeAttempts">>,
+    patch: Partial<
+      Pick<PersistedRunState, "sessionId" | "pendingDelivery" | "queuedDeliveries" | "autoResumeAttempts">
+    >,
     expectedDeliveryId?: string,
   ): boolean {
     const record = readRecord(fs, path);
     if (!record) return false;
-    if (
-      expectedDeliveryId &&
-      record.pendingDelivery?.deliveryId &&
-      record.pendingDelivery.deliveryId !== expectedDeliveryId
-    )
-      return false;
+    validateExecutionFields({ runId: isHead(record) ? record.index.runId : record.runId, ...patch });
+    if (expectedDeliveryId) {
+      const state = isHead(record) ? hydrate(path, record) : record;
+      const queued = state.queuedDeliveries ?? [];
+      if (state.pendingDelivery?.deliveryId === expectedDeliveryId) {
+        save(path, { ...state, ...patch });
+        return true;
+      }
+      if (!queued.some((marker) => marker.deliveryId === expectedDeliveryId)) return false;
+      const { pendingDelivery: _currentSlot, queuedDeliveries: _queue, ...other } = patch;
+      save(path, {
+        ...state,
+        ...other,
+        queuedDeliveries: queued.filter((marker) => marker.deliveryId !== expectedDeliveryId),
+      });
+      return true;
+    }
     if (!isHead(record)) {
       save(path, { ...record, ...patch });
       return true;

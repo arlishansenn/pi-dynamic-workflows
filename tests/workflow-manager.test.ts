@@ -7290,3 +7290,154 @@ return await agent('x')`;
     assert.deepEqual(events, [runId], "watchers still get the lifecycle fact");
   }),
 );
+
+test(
+  "execution identity is durable before start and increments only on real resume",
+  withTempCwd(async (cwd) => {
+    const manager = new WorkflowManager({ cwd, agent: fakeAgent() });
+    manager.setSessionId("origin-one");
+    const seen: unknown[] = [];
+    manager.on("started", ({ runId, ...identity }) => {
+      const state = manager.getPersistence().load(runId);
+      seen.push({ identity, epoch: state?.executionEpoch });
+    });
+    const { runId, promise } = manager.startInBackground(oneAgentScript);
+    await promise;
+    assert.deepEqual(seen, [
+      { identity: { contractVersion: 1, executionEpoch: 1, originSessionId: "origin-one" }, epoch: 1 },
+    ]);
+    const persistence = manager.getPersistence();
+    const state = persistence.load(runId);
+    assert.ok(state);
+    persistence.save({
+      ...state,
+      status: "paused",
+      pendingDelivery: { kind: "text", text: "old report", deliveryId: "old-delivery" },
+    });
+    const cold = new WorkflowManager({ cwd, agent: fakeAgent() });
+    cold.setSessionId("origin-two");
+    const completed = once(cold, "complete");
+    assert.equal(await cold.resume(runId), true);
+    assert.equal(await cold.resume(runId), false);
+    await completed;
+    const resumed = persistence.load(runId);
+    assert.equal(resumed?.executionEpoch, 2);
+    assert.equal(resumed?.originSessionId, "origin-two");
+    assert.equal(resumed?.pendingDelivery, undefined);
+    assert.deepEqual(resumed?.queuedDeliveries, [{ kind: "text", text: "old report", deliveryId: "old-delivery" }]);
+  }),
+);
+
+test(
+  "resume identity commit failure neither publishes nor executes and restores the old entry",
+  withTempCwd(async (cwd) => {
+    let calls = 0;
+    const manager = new WorkflowManager({
+      cwd,
+      agent: {
+        async run() {
+          calls++;
+          return "ok";
+        },
+      },
+    });
+    const { runId, promise } = manager.startInBackground(oneAgentScript);
+    await promise;
+    const persistence = manager.getPersistence();
+    const state = persistence.load(runId);
+    assert.ok(state);
+    persistence.save({ ...state, status: "paused" });
+    const before = manager.getRun(runId);
+    let resumed = 0;
+    manager.on("resumed", () => resumed++);
+    const save = persistence.save;
+    persistence.save = () => {
+      throw new Error("identity commit failed");
+    };
+    try {
+      await assert.rejects(manager.resume(runId), /identity commit failed/);
+    } finally {
+      persistence.save = save;
+    }
+    assert.equal(resumed, 0);
+    assert.equal(calls, 1);
+    assert.equal(manager.getRun(runId), before);
+    assert.equal(persistence.load(runId)?.executionEpoch, 1);
+    const lease = persistence.acquireRunLease(runId);
+    assert.ok(lease);
+    persistence.releaseRunLease(lease);
+  }),
+);
+
+test(
+  "legacy complete pending freezes the old summary without inventing v1 on resume",
+  withTempCwd(async (cwd) => {
+    const manager = new WorkflowManager({ cwd, agent: fakeAgent() });
+    const persistence = manager.getPersistence();
+    persistence.save({
+      runId: "legacy-complete",
+      workflowName: "old-workflow",
+      script: oneAgentScript,
+      status: "paused",
+      result: { verdict: "OLD RESULT ONLY" },
+      pendingDelivery: { kind: "complete", deliveryId: "legacy-id" },
+      phases: [],
+      agents: [],
+      logs: [],
+      startedAt: "2026-07-18T00:00:00.000Z",
+      updatedAt: "2026-07-18T00:00:00.000Z",
+    });
+    manager.setSessionId("new-origin");
+    const completed = once(manager, "complete");
+    assert.equal(await manager.resume("legacy-complete"), true);
+    await completed;
+    const state = persistence.load("legacy-complete");
+    assert.equal(state?.executionEpoch, 1);
+    const queued = state?.queuedDeliveries?.[0];
+    assert.equal(queued?.kind, "text");
+    assert.equal(queued?.identity, undefined);
+    assert.equal(queued?.deliveryId, "legacy-id");
+    assert.ok(queued?.kind === "text");
+    assert.match(queued.text, /OLD RESULT ONLY/);
+    assert.match(queued.text, /old-workflow/);
+    assert.equal(state?.pendingDelivery, undefined);
+  }),
+);
+
+test(
+  "resume refuses epoch overflow without execution, events, or a retained lease",
+  withTempCwd(async (cwd) => {
+    let calls = 0;
+    const manager = new WorkflowManager({
+      cwd,
+      agent: {
+        async run() {
+          calls++;
+          return "bad";
+        },
+      },
+    });
+    const persistence = manager.getPersistence();
+    persistence.save({
+      runId: "epoch-overflow",
+      executionEpoch: Number.MAX_SAFE_INTEGER,
+      workflowName: "overflow",
+      script: oneAgentScript,
+      status: "paused",
+      phases: [],
+      agents: [],
+      logs: [],
+      startedAt: "2026-07-18T00:00:00.000Z",
+      updatedAt: "2026-07-18T00:00:00.000Z",
+    });
+    let events = 0;
+    manager.on("resumed", () => events++);
+    await assert.rejects(manager.resume("epoch-overflow"), /epoch exhausted/);
+    assert.equal(calls, 0);
+    assert.equal(events, 0);
+    assert.equal(manager.getRun("epoch-overflow"), undefined);
+    const lease = persistence.acquireRunLease("epoch-overflow");
+    assert.ok(lease);
+    persistence.releaseRunLease(lease);
+  }),
+);

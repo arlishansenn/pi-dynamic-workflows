@@ -19,6 +19,7 @@ import { isProviderUsageLimit, WorkflowCheckpointSuspensionError, WorkflowError,
 import {
   agentHasNonTerminalStatus,
   createRunPersistence,
+  executionIdentity,
   generateRunId,
   INTERRUPTED_AGENT_CAUSE,
   type PendingDeliveryMarker,
@@ -44,6 +45,7 @@ import {
   type WorkflowResumeMode,
   type WorkflowRunResult,
 } from "./workflow.js";
+import { persistedDeliveryText } from "./workflow-delivery-text.js";
 
 /** Per-execution identity for an abort initiated by pause()/stop(). */
 interface LifecycleControl {
@@ -86,6 +88,9 @@ async function waitForPausedExecutionSettlement(execution: Promise<unknown>): Pr
 
 export interface ManagedRun {
   runId: string;
+  executionEpoch?: number;
+  originSessionId?: string;
+  queuedDeliveries?: PendingDeliveryMarker[];
   status: RunStatus;
   snapshot: WorkflowSnapshot;
   result?: WorkflowRunResult;
@@ -611,7 +616,7 @@ export class WorkflowManager extends EventEmitter {
     let adopted = 0;
     for (const managed of this.runs.values()) {
       const active = managed.status === "running" || managed.status === "paused";
-      const undelivered = managed.pendingDelivery != null;
+      const undelivered = managed.pendingDelivery != null || !!managed.queuedDeliveries?.length;
       if (!active && !undelivered) continue;
       if (managed.sessionId === sessionId) continue;
       managed.sessionId = sessionId;
@@ -623,7 +628,7 @@ export class WorkflowManager extends EventEmitter {
     // or null sessionIds here (null live rows are claimed at bind flush).
     try {
       for (const state of this.persistence.list()) {
-        if (!state.pendingDelivery) continue;
+        if (!state.pendingDelivery && !state.queuedDeliveries?.length) continue;
         if (this.runs.has(state.runId)) continue;
         if (state.sessionId === sessionId) continue;
         if (prev == null || state.sessionId !== prev) continue;
@@ -755,6 +760,8 @@ export class WorkflowManager extends EventEmitter {
       args,
       journal: [],
       background: true,
+      executionEpoch: 1,
+      originSessionId: this.sessionId || undefined,
       sessionId: this.sessionId,
       parentSessionId: this.sessionId,
       parentSessionFile: this.sessionFile,
@@ -793,6 +800,8 @@ export class WorkflowManager extends EventEmitter {
         script,
         args,
         sessionId: managed.sessionId,
+        executionEpoch: managed.executionEpoch,
+        originSessionId: managed.originSessionId,
         parentSessionId: managed.parentSessionId,
         parentSessionFile: managed.parentSessionFile,
         status: "running",
@@ -821,7 +830,7 @@ export class WorkflowManager extends EventEmitter {
       throw err;
     }
 
-    this.emit("started", { runId });
+    this.emit("started", { ...executionIdentity(managed), runId });
 
     // Run workflow asynchronously.
     // Attach a side-channel catch to prevent Node.js unhandled-rejection crashes
@@ -859,8 +868,14 @@ export class WorkflowManager extends EventEmitter {
     this.runs.set(managed.runId, managed);
     // Persist the initial state immediately so listRuns()/the task panel can see
     // the run the moment it starts, not only after the first agent journals.
-    this.persistRun(managed);
-    this.emit("started", { runId: managed.runId });
+    try {
+      this.persistRun(managed, true);
+    } catch (error) {
+      this.releaseRunLease(managed);
+      this.runs.delete(managed.runId);
+      throw error;
+    }
+    this.emit("started", { ...executionIdentity(managed), runId: managed.runId });
     const execution = this.executeRun(managed, script, args, exec);
     this.executions.set(managed, execution);
     return execution;
@@ -897,6 +912,8 @@ export class WorkflowManager extends EventEmitter {
       args,
       journal: [],
       background: false,
+      executionEpoch: 1,
+      originSessionId: this.sessionId || undefined,
       sessionId: this.sessionId,
       parentSessionId: this.sessionId,
       parentSessionFile: this.sessionFile,
@@ -1479,8 +1496,13 @@ export class WorkflowManager extends EventEmitter {
    * through this helper — those methods own the transition and ARE current
    * at the moment they fire, same precedent as their persist/lease calls.
    */
-  private emitLive(managed: ManagedRun, event: string, payload: unknown): void {
-    if (this.isCurrent(managed)) this.emit(event, payload);
+  private emitLive(managed: ManagedRun, event: string, payload: object): void {
+    if (this.isCurrent(managed))
+      this.emit(event, {
+        ...payload,
+        ...executionIdentity(managed),
+        ...(["complete", "error", "paused"].includes(event) ? { executionRun: managed } : {}),
+      });
   }
 
   /**
@@ -1688,12 +1710,15 @@ export class WorkflowManager extends EventEmitter {
         // mid-flight setSessionId() must not re-home it implicitly; only the
         // explicit adoptLiveRunsToSession() path may do so.
         sessionId: managed.sessionId,
+        executionEpoch: managed.executionEpoch,
+        originSessionId: managed.originSessionId,
         // Immutable lineage — unlike sessionId, these are never re-homed by a
         // session replacement or adoptLiveRunsToSession().
         parentSessionId: managed.parentSessionId,
         parentSessionFile: managed.parentSessionFile,
         // Fail-closed delivery marker — survives endpoint gaps / process restart.
         pendingDelivery: managed.pendingDelivery,
+        queuedDeliveries: managed.queuedDeliveries,
         journal: keepsResumeJournal ? managed.journal : undefined,
         status: managed.status,
         error: persistError?.message,
@@ -1784,7 +1809,7 @@ export class WorkflowManager extends EventEmitter {
 
     managed.status = "paused";
     this.abortForLifecycleControl(managed, "pause");
-    this.emit("paused", { runId });
+    this.emit("paused", { ...executionIdentity(managed), runId });
     // Persist the requested lifecycle state immediately, but retain the lease
     // until executeRun settles and writes exact abort-teardown usage.
     this.persistRun(managed);
@@ -1952,6 +1977,26 @@ export class WorkflowManager extends EventEmitter {
       this.persistence.releaseRunLease(lease);
       return false;
     }
+    let nextEpoch: number;
+    let displacedDeliveries: PendingDeliveryMarker[];
+    try {
+      executionIdentity(persisted);
+      nextEpoch = (persisted.executionEpoch ?? 0) + 1;
+      if (!Number.isSafeInteger(nextEpoch)) throw new Error("Execution epoch exhausted");
+      displacedDeliveries = [...(persisted.queuedDeliveries ?? [])];
+      let pending = persisted.pendingDelivery;
+      if (pending?.kind === "complete") {
+        pending = { ...pending, kind: "text", text: persistedDeliveryText(persisted, this.persistence) };
+      }
+      if (
+        pending &&
+        !displacedDeliveries.some((marker) => pending?.deliveryId && marker.deliveryId === pending.deliveryId)
+      )
+        displacedDeliveries.push(pending);
+    } catch (error) {
+      this.persistence.releaseRunLease(lease);
+      throw error;
+    }
     const script = opts?.script ?? persisted.script;
     const args = opts?.args !== undefined ? opts.args : persisted.args;
     const persistedAgents = Array.isArray(persisted.agents) ? persisted.agents : [];
@@ -2116,7 +2161,9 @@ export class WorkflowManager extends EventEmitter {
       parentSessionFile: persisted.parentSessionFile,
       // Carry any undelivered conversation payload across resume so session_start
       // flush can still re-inject after a pause/restart gap.
-      pendingDelivery: persisted.pendingDelivery,
+      executionEpoch: nextEpoch,
+      originSessionId: this.sessionId || undefined,
+      queuedDeliveries: displacedDeliveries,
       lease,
       // Carry the original opt-out forward across resumes; it's fixed at
       // run-start and persistRun() re-persists it on every subsequent write.
@@ -2196,7 +2243,14 @@ export class WorkflowManager extends EventEmitter {
     this.runs.set(runId, managed);
     // Persist before notifying renderers: listRuns() is their source of truth for
     // lifecycle status, while getRun() supplies the live in-memory snapshot.
-    this.persistRun(managed);
+    try {
+      this.persistRun(managed, true);
+    } catch (error) {
+      if (active) this.runs.set(runId, active);
+      else this.runs.delete(runId);
+      this.releaseRunLease(managed);
+      throw error;
+    }
     // Namespace by (runId, index) exactly like the live onAgentJournal dedup
     // above and like SharedStore's deltaKey — see JournalEntry.runId. A
     // legacy entry persisted before namespacing existed has no `runId`; it is
@@ -2206,7 +2260,7 @@ export class WorkflowManager extends EventEmitter {
     // at the same index (last write wins) and the call hash is the only guard
     // — an identical top-level call can replay the nested frame's result.
     const resumeJournal = new Map(persistedJournal.map((e) => [`${e.runId ?? runId}:${e.index}`, e] as const));
-    this.emit("resumed", { runId });
+    this.emit("resumed", { ...executionIdentity(managed), runId });
     // Run in the background; executeRun records status/errors on the managed run.
     // initialTokenUsage seeds the resumed execution's fresh SharedRuntime.spent
     // (A2) from the persisted total-at-pause, so the tokenBudget cap holds
@@ -2281,7 +2335,7 @@ export class WorkflowManager extends EventEmitter {
         recoverable: true,
       });
       this.abortForLifecycleControl(managed, "stop");
-      this.emit("stopped", { runId });
+      this.emit("stopped", { ...executionIdentity(managed), runId });
       this.persistRun(managed);
       this.releaseRunLease(managed);
       if (hadNoPendingSettle) this.recordTerminalRun(runId);
@@ -2313,7 +2367,7 @@ export class WorkflowManager extends EventEmitter {
     } finally {
       this.persistence.releaseRunLease(lease);
     }
-    this.emit("stopped", { runId });
+    this.emit("stopped", { ...executionIdentity(persisted), runId });
     return true;
   }
 

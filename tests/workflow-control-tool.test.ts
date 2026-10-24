@@ -423,3 +423,15 @@ test("status marks an agent-sum-derived estimated total with ~ (#209)", async ()
   assert.match(text(status), /tokens=~80$/, "the agent-usage branch carries the flag");
   assert.equal((status.details.run as { tokenTotalEstimated?: boolean }).tokenTotalEstimated, true);
 });
+
+test("workflow_control status preserves durable execution and routing identity", async () => {
+  const item = { ...run(), executionEpoch: 7, originSessionId: "launch-session", sessionId: "adopted-session" };
+  const { manager } = fakeManager([item]);
+  const response = await execute(manager, { action: "status", runId: item.runId });
+  const details = response.details.run as WorkflowControlRunDetails;
+  assert.equal(details.contractVersion, 1);
+  assert.equal(details.executionEpoch, 7);
+  assert.equal(details.originSessionId, "launch-session");
+  assert.equal(details.sessionId, "adopted-session");
+  assert.equal(details.status, "running");
+});

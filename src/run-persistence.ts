@@ -82,8 +82,39 @@ export function sanitizeResumeMode(value: unknown): WorkflowResumeMode | undefin
   return value === "prefix" || value === "replay-completed" ? value : undefined;
 }
 
+export interface WorkflowExecutionIdentity {
+  contractVersion: 1;
+  runId: string;
+  executionEpoch: number;
+  originSessionId?: string;
+}
+
+export interface WorkflowResultDetails extends WorkflowExecutionIdentity {
+  deliveryId: string;
+  sessionId: string;
+}
+
+export function executionIdentity(run: {
+  runId: string;
+  executionEpoch?: number;
+  originSessionId?: string;
+}): WorkflowExecutionIdentity | undefined {
+  if (run.executionEpoch === undefined) return undefined;
+  if (!Number.isSafeInteger(run.executionEpoch) || run.executionEpoch <= 0) throw new Error("Invalid execution epoch");
+  if (run.originSessionId !== undefined && !run.originSessionId.trim()) throw new Error("Invalid execution origin");
+  return {
+    contractVersion: 1,
+    runId: run.runId,
+    executionEpoch: run.executionEpoch,
+    ...(run.originSessionId ? { originSessionId: run.originSessionId } : {}),
+  };
+}
+
 export interface PersistedRunState {
   runId: string;
+  executionEpoch?: number;
+  originSessionId?: string;
+  queuedDeliveries?: PendingDeliveryMarker[];
   workflowName: string;
   script: string;
   args?: unknown;
@@ -213,8 +244,8 @@ export interface PersistedRunState {
   /**
    * Undelivered background-result payload waiting for the originating session's
    * delivery endpoint. Written before the send attempt (fail-closed); cleared
-   * only after a successful session-routed delivery. `complete` recomputes text
-   * from the persisted result on flush so we don't retain a second full copy.
+   * only after a successful session-routed delivery. New reports freeze their
+   * rendered text and execution identity; legacy complete markers remain readable.
    */
   pendingDelivery?: PendingDeliveryMarker;
 }
@@ -223,9 +254,10 @@ export interface PersistedRunState {
  * Disk/memory marker for a background result that still needs conversation
  * delivery. Kept small on purpose — never store full agent transcripts here.
  */
-export type PendingDeliveryMarker =
+export type PendingDeliveryMarker = (
   | { kind: "complete"; deliveryId?: string }
-  | { kind: "text"; text: string; deliveryId?: string };
+  | { kind: "text"; text: string; deliveryId?: string }
+) & { identity?: WorkflowExecutionIdentity };
 
 export interface RunPersistence {
   /** Immutable, directly readable result artifact for conversation delivery. */
@@ -239,7 +271,9 @@ export interface RunPersistence {
   /** Merge small delivery/ownership fields without hydrating the run history. */
   updateMetadata?(
     runId: string,
-    patch: Partial<Pick<PersistedRunState, "sessionId" | "pendingDelivery" | "autoResumeAttempts">>,
+    patch: Partial<
+      Pick<PersistedRunState, "sessionId" | "pendingDelivery" | "queuedDeliveries" | "autoResumeAttempts">
+    >,
     expectedDeliveryId?: string,
   ): boolean;
   /** Load a persisted run by ID. */
@@ -569,7 +603,7 @@ export function createRunPersistence(
   // filtered out before the cap is even considered.
   const enforceRetention = () => {
     const terminal = computeList()
-      .filter((r) => TERMINAL_RUN_STATUSES.has(r.status) && !r.pendingDelivery)
+      .filter((r) => TERMINAL_RUN_STATUSES.has(r.status) && !r.pendingDelivery && !r.queuedDeliveries?.length)
       .sort((a, b) => new Date(a.updatedAt).getTime() - new Date(b.updatedAt).getTime());
     const excess = terminal.length - maxTerminalRunsOnDisk;
     if (excess <= 0) return;
@@ -584,7 +618,13 @@ export function createRunPersistence(
           )
             return;
           const fresh = records.peek(primaryRunPath(run.runId)) ?? records.peek(legacyRunPath(run.runId));
-          if (fresh && TERMINAL_RUN_STATUSES.has(fresh.status) && !fresh.pendingDelivery) deleteRunFiles(run.runId);
+          if (
+            fresh &&
+            TERMINAL_RUN_STATUSES.has(fresh.status) &&
+            !fresh.pendingDelivery &&
+            !fresh.queuedDeliveries?.length
+          )
+            deleteRunFiles(run.runId);
         });
       } catch {
         // Contended or unreadable records remain available for the next pass.
