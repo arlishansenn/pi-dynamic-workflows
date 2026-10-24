@@ -7,26 +7,17 @@ import type { ManagedRun } from "./workflow-manager.js";
  *  via the `deliveredResultMaxChars` setting in ~/.pi/workflows/settings.json. */
 export const DEFAULT_DELIVERED_MAX_CHARS = 400;
 
-/** Human-readable byte size for the dropped-tail hint: 512 B, 3.2 KB, 1.4 MB. */
 function formatBytes(n: number): string {
   if (n < 1024) return `${n} B`;
   if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
   return `${(n / (1024 * 1024)).toFixed(1)} MB`;
 }
 
-/**
- * Pick a clean human-readable summary from a workflow result, in order of
- * preference: a `verdict`/`report`/`summary`/`synthesis` string field, a bare
- * string result, else a JSON dump capped at `maxChars`. When the dump is truncated the
- * dropped size is reported (the full result is still reachable via the pointer
- * that {@link deliverText} appends).
- */
 function summarizeResult(result: unknown, maxChars: number = DEFAULT_DELIVERED_MAX_CHARS): string {
   if (typeof result === "string") return result;
   if (result == null) return "null";
   if (typeof result === "object") {
     const obj = result as Record<string, unknown>;
-    // `synthesis` is what the built-in multi-perspective workflow returns.
     for (const key of ["verdict", "report", "summary", "synthesis"] as const) {
       const val = obj[key];
       if (typeof val === "string" && val.trim()) return val;
@@ -34,8 +25,6 @@ function summarizeResult(result: unknown, maxChars: number = DEFAULT_DELIVERED_M
   }
   const json = JSON.stringify(result, null, 2);
   if (json.length <= maxChars) return json;
-  // Slice once (the kept head); derive the dropped size by byte-length subtraction
-  // so we don't also allocate the (potentially large) truncated tail to measure it.
   const kept = json.slice(0, maxChars);
   const droppedBytes = Buffer.byteLength(json, "utf8") - Buffer.byteLength(kept, "utf8");
   return `${kept}\n…(truncated ${formatBytes(droppedBytes)})`;
@@ -65,8 +54,6 @@ export function deliverText(
     "",
     summary,
   ];
-  // Always point at the full persisted result so the tail is never lost — even when
-  // the summary above is a complete verdict/summary field or an untruncated dump.
   if (opts.resultPath) lines.push("", `↳ Full result: ${opts.resultPath}`);
   return lines.join("\n");
 }
